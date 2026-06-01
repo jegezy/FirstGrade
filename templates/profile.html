@@ -12,6 +12,6 @@
     <p><strong>Дата регистрации:</strong> {{ user['created_at'] }}</p>
 
     <p><strong>Роль:</strong> {% if user['is_admin'] == 1 %}Администратор{% else %}Пользователь{% endif %}</p>
-    <a href="/{{ user['username'] }}/refresh_token" class="btn btn-outline-primary">Обновить токен</a>
+    <a href="/profile/{{ user['username'] }}/refresh_token" class="btn btn-outline-primary">Обновить токен</a>
 </div>
 {% endblock %}

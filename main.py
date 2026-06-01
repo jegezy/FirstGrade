@@ -1,11 +1,17 @@
-import uuid, os, json, re, jwt, psycopg2, psycopg2.extras
+import uuid, os, json, re, jwt
 
-from flask import Flask, render_template, request, redirect, make_response
+from flask import Flask, render_template, request, redirect, make_response, jsonify
 from werkzeug.security import generate_password_hash, check_password_hash
-from flask import jsonify
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from dotenv import load_dotenv
+from database.db import get_db, fetchone
+from database.crud import (
+    get_all_items, get_item_by_id, create_item, update_item, delete_item,
+    get_user_by_id, get_user_by_username, get_user_by_login, create_user,
+    get_orders_by_user, get_all_orders, get_existing_order, create_order, update_order_status,
+    get_dashboard_data, create_hash_log
+)
 
 load_dotenv()
 
@@ -14,46 +20,12 @@ app.secret_key = os.getenv("SECRET_KEY")
 JWT_SECRET = os.getenv("JWT_SECRET")
 
 
-DB_CONFIG = {
-    'dbname': os.getenv('DB_NAME'),
-    'user': os.getenv('DB_USER'),
-    'password': os.getenv('DB_PASSWORD'),
-    'host': os.getenv('DB_HOST'),
-    'port': os.getenv('DB_PORT')
-}
-
-DB_SLAVE_CONFIG = {
-    'dbname': os.getenv('DB_SLAVE_NAME'),
-    'user': os.getenv('DB_USER'),
-    'password': os.getenv('DB_PASSWORD'),
-    'host': os.getenv('DB_SLAVE_HOST'),
-    'port': os.getenv('DB_SLAVE_PORT')
-}
-
-
-def get_db():
-    conn = psycopg2.connect(**DB_CONFIG)
-    conn.autocommit = False
-    return conn
-
-
-def get_slave_db():
-    conn = psycopg2.connect(**DB_SLAVE_CONFIG)
-    return conn
-
-
-def fetchone(cur):
-    row = cur.fetchone()
-    if row is None:
-        return None
-    cols = [desc[0] for desc in cur.description]
-    return dict(zip(cols, row))
-
-
-def fetchall(cur):
-    rows = cur.fetchall()
-    cols = [desc[0] for desc in cur.description]
-    return [dict(zip(cols, row)) for row in rows]
+def create_token(user_id):
+    payload = {
+        'user_id': user_id,
+        'exp': datetime.now(timezone.utc) + timedelta(days=7)
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm='HS256')
 
 
 def get_current_user():
@@ -62,12 +34,7 @@ def get_current_user():
         return None
     try:
         data = jwt.decode(token, JWT_SECRET, algorithms=['HS256'])
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('SELECT * FROM "user" WHERE id = %s', (data['user_id'],))
-        row = fetchone(cur)
-        conn.close()
-        return row
+        return get_user_by_id(data['user_id'])
     except:
         return None
 
@@ -92,14 +59,6 @@ def admin_required(f):
             return redirect('/index')
         return f(*args, **kwargs)
     return decorated
-
-
-def create_token(user_id):
-    payload = {
-        'user_id': user_id,
-        'exp': datetime.now(timezone.utc) + timedelta(days=7)
-    }
-    return jwt.encode(payload, JWT_SECRET, algorithm='HS256')
 
 
 def validate_password(password):
@@ -170,27 +129,7 @@ def index():
     type_filter = request.args.get('type')
     condition_filter = request.args.get('condition')
     sort = request.args.get('sort')
-
-    sql = "SELECT * FROM item WHERE status = 'active'"
-    params = []
-
-    if type_filter:
-        sql += " AND type = %s"
-        params.append(type_filter)
-    if condition_filter:
-        sql += " AND condition = %s"
-        params.append(condition_filter)
-    if sort == 'price_asc':
-        sql += " ORDER BY price ASC"
-    elif sort == 'price_desc':
-        sql += " ORDER BY price DESC"
-
-    conn = get_slave_db()
-    cur = conn.cursor()
-    cur.execute(sql, params)
-    data = fetchall(cur)
-    conn.close()
-
+    data = get_all_items(type_filter, condition_filter, sort)
     return render_template('index.html', data=data)
 
 
@@ -221,14 +160,7 @@ def create():
             return render_template('create.html', error='Все поля должны быть заполнены')
 
         try:
-            conn = get_db()
-            cur = conn.cursor()
-            cur.execute(
-                "INSERT INTO item (title, price, type, condition, description, number) VALUES (%s, %s, %s, %s, %s, %s)",
-                (title, price, type_, condition, description, number)
-            )
-            conn.commit()
-            conn.close()
+            create_item(title, price, type_, condition, description, number)
             return redirect('/index')
         except Exception as e:
             return f"Ошибка: {e}"
@@ -239,11 +171,7 @@ def create():
 @app.route('/edit/<int:id>', methods=['POST', 'GET'])
 @admin_required
 def edit(id):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM item WHERE id = %s", (id,))
-    item = fetchone(cur)
-    conn.close()
+    item = get_item_by_id(id)
 
     if request.method == 'POST':
         title = request.form['title'].strip()
@@ -254,14 +182,7 @@ def edit(id):
         number = request.form['number'].strip()
 
         try:
-            conn = get_db()
-            cur = conn.cursor()
-            cur.execute(
-                "UPDATE item SET title=%s, price=%s, type=%s, condition=%s, description=%s, number=%s WHERE id=%s",
-                (title, price, type_, condition, description, number, id)
-            )
-            conn.commit()
-            conn.close()
+            update_item(id, title, price, type_, condition, description, number)
             return redirect('/index')
         except Exception as e:
             return f"Ошибка: {e}"
@@ -273,11 +194,7 @@ def edit(id):
 @admin_required
 def delete(id):
     try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM item WHERE id = %s", (id,))
-        conn.commit()
-        conn.close()
+        delete_item(id)
         return redirect('/index')
     except Exception as e:
         return f"Ошибка: {e}"
@@ -303,14 +220,7 @@ def register():
         created_at = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
 
         try:
-            conn = get_db()
-            cur = conn.cursor()
-            cur.execute(
-                'INSERT INTO "user" (username, email, password, is_admin, uuid, created_at) VALUES (%s, %s, %s, %s, %s, %s)',
-                (username, email, hashed_password, 0, user_uuid, created_at)
-            )
-            conn.commit()
-            conn.close()
+            create_user(username, email, hashed_password, user_uuid, created_at)
             return redirect('/login')
         except Exception:
             return render_template('register.html', error='Логин или Email уже занят')
@@ -324,14 +234,7 @@ def login():
         login_input = request.form['login']
         password = request.form['password']
 
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute(
-            'SELECT * FROM "user" WHERE email = %s OR username = %s',
-            (login_input, login_input)
-        )
-        row = fetchone(cur)
-        conn.close()
+        row = get_user_by_login(login_input)
 
         if row and check_password_hash(row['password'], password):
             token = create_token(row['id'])
@@ -354,17 +257,7 @@ def logout():
 @app.route('/api/hash/<string:text>')
 def hash_string(text):
     hashed = generate_password_hash(text)
-    created_at = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO hash_log (request, result, created_at) VALUES (%s, %s, %s)",
-        (text, hashed, created_at)
-    )
-    conn.commit()
-    conn.close()
-
+    create_hash_log(text, hashed)
     return jsonify({"request": text, "result": hashed})
 
 
@@ -374,13 +267,8 @@ def profile(username):
     token = request.cookies.get('jwt_token')
     data = jwt.decode(token, JWT_SECRET, algorithms=['HS256'])
 
-    conn = get_slave_db()
-    cur = conn.cursor()
-    cur.execute('SELECT * FROM "user" WHERE id = %s', (data['user_id'],))
-    current = fetchone(cur)
-    cur.execute('SELECT * FROM "user" WHERE username = %s', (username,))
-    row = fetchone(cur)
-    conn.close()
+    current = get_user_by_id(data['user_id'])
+    row = get_user_by_username(username)
 
     if not row:
         return "Пользователь не найден", 404
@@ -408,27 +296,11 @@ def buy(item_id):
     token = request.cookies.get('jwt_token')
     data = jwt.decode(token, JWT_SECRET, algorithms=['HS256'])
 
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT * FROM orders WHERE user_id = %s AND item_id = %s",
-        (data['user_id'], item_id)
-    )
-    existing = fetchone(cur)
-
+    existing = get_existing_order(data['user_id'], item_id)
     if existing:
-        conn.close()
         return redirect('/index?error=already_bought')
 
-    created_at = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-    cur.execute(
-        "INSERT INTO orders (user_id, item_id, status, created_at) VALUES (%s, %s, %s, %s)",
-        (data['user_id'], item_id, 'pending', created_at)
-    )
-    cur.execute("UPDATE item SET status = 'sold' WHERE id = %s", (item_id,))
-    conn.commit()
-    conn.close()
-
+    create_order(data['user_id'], item_id)
     return redirect('/orders')
 
 
@@ -437,40 +309,21 @@ def buy(item_id):
 def orders():
     token = request.cookies.get('jwt_token')
     data = jwt.decode(token, JWT_SECRET, algorithms=['HS256'])
-
-    conn = get_slave_db()
-    cur = conn.cursor()
-    cur.execute(
-        "SELECT orders.id, item.title, item.price, orders.status, orders.created_at FROM orders JOIN item ON orders.item_id = item.id WHERE orders.user_id = %s",
-        (data['user_id'],)
-    )
-    data_orders = fetchall(cur)
-    conn.close()
-
+    data_orders = get_orders_by_user(data['user_id'])
     return render_template('orders.html', orders=data_orders)
 
 
 @app.route('/admin/orders')
 @admin_required
 def admin_orders():
-    conn = get_slave_db()
-    cur = conn.cursor()
-    cur.execute(
-        'SELECT orders.id, "user".username, item.title, orders.status, orders.created_at FROM orders JOIN "user" ON orders.user_id = "user".id JOIN item ON orders.item_id = item.id'
-    )
-    data = fetchall(cur)
-    conn.close()
+    data = get_all_orders()
     return render_template('admin_orders.html', orders=data)
 
 
 @app.route('/order/<int:order_id>/status/<string:status>')
 @admin_required
 def change_order_status(order_id, status):
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("UPDATE orders SET status = %s WHERE id = %s", (status, order_id))
-    conn.commit()
-    conn.close()
+    update_order_status(order_id, status)
     return redirect('/admin/orders')
 
 
@@ -483,20 +336,7 @@ def dashboard():
 @app.route('/api/dashboard')
 @admin_required
 def api_dashboard():
-    conn = get_slave_db()
-    cur = conn.cursor()
-
-    cur.execute("SELECT status, COUNT(*) as count FROM orders GROUP BY status")
-    orders_by_status = fetchall(cur)
-
-    cur.execute("SELECT type, COUNT(*) as count FROM item GROUP BY type")
-    items_by_type = fetchall(cur)
-
-    cur.execute("SELECT DATE(created_at) as date, COUNT(*) as count FROM orders GROUP BY DATE(created_at) ORDER BY date")
-    orders_by_date = fetchall(cur)
-
-    conn.close()
-
+    orders_by_status, items_by_type, orders_by_date = get_dashboard_data()
     status_map = {'pending': 'В обработке', 'paid': 'Оплачен', 'delivered': 'Доставлен'}
     return app.response_class(
         response=json.dumps({
